@@ -1,0 +1,54 @@
+# Data
+# ----
+data:
+  dataset: "squad"                    # HuggingFace dataset name
+  split: "train[:1000]"               # Subset to load
+  output_dir: "outputs"               # Where to write results
+
+# Retrieval
+# ---------
+retrieval:
+  model: "all-MiniLM-L6-v2"          # sentence-transformers model
+  k: 5                                # Top-k documents to retrieve
+  index_type: "IndexFlatIP"           # FAISS index (IP = inner product)
+
+# Generation
+# ----------
+generation:
+  model: "gpt-4o-mini"                # OpenAI model for generation + judging
+  temperature: 0                      # Deterministic generation
+  max_tokens: 64                      # Response length limit
+  sleep_seconds: 0.1                  # Rate limit buffer between API calls
+
+# Evaluation
+# ----------
+evaluation:
+  baseline_sample_size: 100           # QA pairs for baseline eval (Phase 3)
+  shift_sample_size: 150              # Questions to paraphrase (Phase 4)
+  shift_temperature: 0.7              # Temperature for paraphrasing (higher = more variation)
+
+# Reporting
+# ---------
+reporting:
+  final_report_name: "evaluation_report.json"
+  include_per_question_results: true  # Whether to include detailed per-Q breakdown
+
+# OpenShift / Kubernetes
+# ----------------------
+# These are not used by the Python code but document deployment expectations
+deployment:
+  image: "rag-eval:latest"
+  namespace: "rag-evaluation"
+  secrets:
+    - name: "openai-api-key"
+      env_var: "OPENAI_API_KEY"
+  resources:
+    requests:
+      memory: "2Gi"
+      cpu: "1"
+    limits:
+      memory: "4Gi"
+      cpu: "2"
+  storage:
+    pvc_name: "rag-eval-storage"
+    mount_path: "/data"

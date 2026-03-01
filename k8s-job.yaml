@@ -1,0 +1,228 @@
+# PREREQUISITES:
+# 1. Install External Secrets Operator:
+#      helm repo add external-secrets https://charts.external-secrets.io
+#      helm install external-secrets external-secrets/external-secrets \
+#        -n external-secrets-operator --create-namespace
+#
+# 2. Store your OpenAI key in AWS Secrets Manager:
+#      aws secretsmanager create-secret \
+#        --name rag-eval/openai-api-key \
+#        --secret-string '{"OPENAI_API_KEY":"sk-proj-..."}'
+#
+# 3. Create an IAM role with the policy below and annotate the ServiceAccount
+#    with its ARN (IRSA — IAM Roles for Service Accounts):
+#      {
+#        "Effect": "Allow",
+#        "Action": "secretsmanager:GetSecretValue",
+#        "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:rag-eval/openai-api-key-*"
+#      }
+#
+# USAGE:
+#   oc apply -f k8s-job.yaml -n rag-evaluation
+#   oc logs job/rag-eval-job -n rag-evaluation -f
+#   oc get pvc rag-eval-storage -n rag-evaluation  # Check results
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rag-evaluation
+  labels:
+    app: rag-eval
+
+---
+# ServiceAccount annotated for IRSA so ESO can authenticate to AWS without
+# static credentials. The role ARN must have GetSecretValue on the secret above.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rag-eval-sa
+  namespace: rag-evaluation
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/rag-eval-secret-reader  # REPLACE
+
+---
+# SecretStore — tells ESO which AWS region/account to use and which
+# ServiceAccount to assume for authentication (via IRSA).
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: aws-secretsmanager
+  namespace: rag-evaluation
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: us-east-1  # REPLACE with your region
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: rag-eval-sa
+
+---
+# ExternalSecret — ESO watches this resource and syncs the secret from
+# AWS Secrets Manager into a native k8s Secret (openai-api-key).
+# refreshInterval controls how often ESO re-fetches from AWS SM.
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: openai-api-key
+  namespace: rag-evaluation
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: openai-api-key   # name of the k8s Secret ESO will create/manage
+    creationPolicy: Owner  # ESO owns the Secret; deleting ExternalSecret deletes it
+  data:
+  - secretKey: OPENAI_API_KEY          # key in the resulting k8s Secret
+    remoteRef:
+      key: rag-eval/openai-api-key     # secret name in AWS Secrets Manager
+      property: OPENAI_API_KEY         # JSON property within the secret
+
+---
+# PersistentVolumeClaim for storing evaluation outputs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rag-eval-storage
+  namespace: rag-evaluation
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: gp3  # Uncomment for AWS EBS, adjust for your cluster
+
+---
+# Job definition
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-eval-job
+  namespace: rag-evaluation
+  labels:
+    app: rag-eval
+    component: evaluation
+spec:
+  # Prevent automatic retries (eval should succeed or fail cleanly)
+  backoffLimit: 0
+
+  template:
+    metadata:
+      labels:
+        app: rag-eval
+        component: evaluation
+
+    spec:
+      restartPolicy: Never
+      serviceAccountName: rag-eval-sa
+
+      containers:
+      - name: evaluator
+        image: quay.io/your-org/rag-eval:latest  # REPLACE with your registry
+        imagePullPolicy: Always
+
+        # Entrypoint is defined in Dockerfile
+        args:
+          - "--config"
+          - "/app/config.yaml"
+
+        # OPENAI_API_KEY is injected from the k8s Secret that ESO manages
+        env:
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: openai-api-key
+              key: OPENAI_API_KEY
+
+        # Volume mounts
+        volumeMounts:
+        - name: eval-storage
+          mountPath: /data
+        - name: config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+
+        # Resource requests/limits
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+            # Uncomment if GPU is needed (not required for this eval)
+            # nvidia.com/gpu: "1"
+
+        # Security context (OpenShift requirement)
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+
+      # Volumes
+      volumes:
+      - name: eval-storage
+        persistentVolumeClaim:
+          claimName: rag-eval-storage
+
+      - name: config
+        configMap:
+          name: rag-eval-config
+
+---
+# ConfigMap for config.yaml
+# Allows updating eval parameters without rebuilding the image
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rag-eval-config
+  namespace: rag-evaluation
+data:
+  config.yaml: |
+    # RAG Evaluation Pipeline Configuration
+    data:
+      dataset: "squad"
+      split: "train[:1000]"
+      output_dir: "/data/outputs"  # Writes to PVC
+
+    retrieval:
+      model: "all-MiniLM-L6-v2"
+      k: 5
+      index_type: "IndexFlatIP"
+
+    generation:
+      model: "gpt-4o-mini"
+      temperature: 0
+      max_tokens: 64
+      sleep_seconds: 0.1
+
+    evaluation:
+      baseline_sample_size: 100
+      shift_sample_size: 150
+      shift_temperature: 0.7
+
+    reporting:
+      final_report_name: "evaluation_report.json"
+      include_per_question_results: false  # Set to true for debugging
+
+---
+# OPTIONAL: CronJob for periodic evaluation (e.g., nightly)
+# Uncomment to run eval on a schedule
+# apiVersion: batch/v1
+# kind: CronJob
+# metadata:
+#   name: rag-eval-cronjob
+#   namespace: rag-evaluation
+# spec:
+#   schedule: "0 2 * * *"  # 2 AM daily
+#   jobTemplate:
+#     spec:
+#       template:
+#         # Same spec as Job above
